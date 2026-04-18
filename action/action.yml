@@ -233,8 +233,14 @@ runs:
       env:
         GH_TOKEN: ${{ github.token }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
+        VETTER_API_BASE: ${{ inputs.api-base }}
+        RUN_ID: ${{ steps.validate.outputs.run_id }}
       run: |
         BODY=$(jq -r '.comment // tojson' verdict.json)
+        REPORT_URL="$VETTER_API_BASE/reports/$RUN_ID"
+        if curl -sfI "$REPORT_URL" >/dev/null; then
+          BODY="![Validation report]($REPORT_URL)"$'\n\n'"$BODY"
+        fi
         gh pr comment "$PR_NUMBER" --body "$BODY"
 
     - name: Deregister daemon
@@ -259,3 +265,12 @@ runs:
           tunnel.log
           verdict.json
         if-no-files-found: ignore
+
+    - name: Fail on non-pass verdict
+      if: always() && steps.parse.outputs.status != 'pass'
+      shell: bash
+      env:
+        STATUS: ${{ steps.parse.outputs.status }}
+      run: |
+        echo "vetter verdict: ${STATUS:-error}" >&2
+        exit 1
