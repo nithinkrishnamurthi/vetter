@@ -1,0 +1,244 @@
+name: vetter
+
+# Raw workflow equivalent of the composite action at
+# `nithinkrishnamurthi/vetter/action`. Use this if you prefer to copy-paste
+# and customize the steps yourself (e.g. your app needs a non-standard
+# bring-up flow). For a drop-in, use the composite action instead:
+#
+#   - uses: nithinkrishnamurthi/vetter/action@v1
+#     with:
+#       api-key: ${{ secrets.VETTER_API_KEY }}
+#       env-id: ${{ secrets.VETTER_ENV_ID }}
+#       daemon-token: ${{ secrets.VETTER_DAEMON_TOKEN }}
+#       api-base: ${{ vars.VETTER_API_BASE }}
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: vetter-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write
+
+    env:
+      VETTER_API_BASE: ${{ vars.VETTER_API_BASE }}
+      VETTER_API_KEY: ${{ secrets.VETTER_API_KEY }}
+      VETTER_ENV_ID: ${{ secrets.VETTER_ENV_ID }}
+      VETTER_DAEMON_TOKEN: ${{ secrets.VETTER_DAEMON_TOKEN }}
+      VETTER_DAEMON_URL: ${{ vars.VETTER_DAEMON_URL }}
+      DAEMON_PORT: 8181
+      APP_PORT: 3000
+      DAEMON_NAME: gha-runner
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Configure env
+        run: cp .env.example .env
+
+      - name: Bring up backing services
+        run: npm run dx:up
+
+      - name: Wait for Postgres
+        run: |
+          # `docker compose up -d` returns once containers are created, not
+          # when they're ready. Prisma migrate needs an actually-accepting
+          # database. Container name + user are app-specific — adjust per repo.
+          for i in $(seq 1 90); do
+            if docker exec database pg_isready -U documenso -d documenso >/dev/null 2>&1; then
+              echo "postgres ready"; exit 0
+            fi
+            sleep 2
+          done
+          echo "postgres did not become ready in 180s" >&2
+          docker ps -a >&2
+          docker logs database 2>&1 | tail -80 >&2
+          exit 1
+
+      - name: Migrate + seed database
+        run: |
+          npm run prisma:migrate-dev
+          npm run prisma:seed || true
+
+      - name: Start app
+        run: |
+          nohup npm run dev > app.log 2>&1 &
+          echo "$!" > app.pid
+          for i in $(seq 1 180); do
+            if curl -sf "http://localhost:$APP_PORT" >/dev/null; then
+              echo "app up"; exit 0
+            fi
+            sleep 2
+          done
+          echo "app did not come up" >&2
+          tail -n 200 app.log >&2
+          exit 1
+
+      - name: Install cloudflared
+        run: |
+          curl -sSfLo /tmp/cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x /tmp/cloudflared
+          sudo mv /tmp/cloudflared /usr/local/bin/cloudflared
+
+      - name: Fetch daemon binary
+        run: |
+          curl -sSfL -o daemon "$VETTER_DAEMON_URL"
+          chmod +x daemon
+
+      - name: Prewarm Playwright
+        run: |
+          # Force the one-time Chromium download up-front so the daemon's
+          # MCP child can start fast. Without this, first-run Chromium
+          # install (60-120s) happens while the validator is already
+          # trying to call /tools, causing 404s.
+          npx -y playwright@latest install --with-deps chromium
+
+      - name: Start daemon
+        run: |
+          DAEMON_TOKEN="$VETTER_DAEMON_TOKEN" \
+            nohup ./daemon --port "$DAEMON_PORT" > daemon.log 2>&1 &
+          echo "$!" > daemon.pid
+          for i in $(seq 1 30); do
+            if curl -sf "http://localhost:$DAEMON_PORT/health" >/dev/null; then
+              echo "daemon up"; exit 0
+            fi
+            sleep 1
+          done
+          echo "daemon did not come up" >&2
+          tail -n 200 daemon.log >&2
+          exit 1
+
+      - name: Open tunnel
+        id: tunnel
+        run: |
+          nohup cloudflared tunnel --no-autoupdate --url "http://localhost:$DAEMON_PORT" \
+            > tunnel.log 2>&1 &
+          echo "$!" > tunnel.pid
+          for i in $(seq 1 30); do
+            URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' tunnel.log | head -n1 || true)
+            if [ -n "$URL" ]; then
+              echo "url=$URL" >> "$GITHUB_OUTPUT"
+              echo "tunnel: $URL"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "tunnel did not come up" >&2
+          tail -n 200 tunnel.log >&2
+          exit 1
+
+      - name: Register daemon
+        run: |
+          jq -n \
+            --arg env "$VETTER_ENV_ID" \
+            --arg name "$DAEMON_NAME" \
+            --arg addr "${{ steps.tunnel.outputs.url }}" \
+            --arg tok "$VETTER_DAEMON_TOKEN" \
+            --arg pr "${{ github.event.pull_request.number }}" \
+            '{env_id:$env, name:$name, address:$addr, token:$tok, description:("PR #"+$pr)}' \
+            | curl -sSf -X POST "$VETTER_API_BASE/register" \
+                -H 'Content-Type: application/json' -d @-
+
+      - name: Collect PR context
+        id: context
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          git fetch origin "$BASE_REF" --depth=1 >/dev/null 2>&1 || true
+          if [ -f .vetter/ticket.md ]; then
+            TICKET=$(cat .vetter/ticket.md)
+          else
+            TICKET=""
+          fi
+          DIFF=$(git diff "origin/$BASE_REF"...HEAD -- . ':(exclude)node_modules' ':(exclude)package-lock.json' || true)
+          SUMMARY="PR #${{ github.event.pull_request.number }}: ${PR_TITLE}"$'\n\n'"${PR_BODY}"
+
+          jq -n \
+            --arg repo "${{ github.repository }}" \
+            --arg sha "${{ github.event.pull_request.head.sha }}" \
+            --argjson pr ${{ github.event.pull_request.number }} \
+            --arg url "http://localhost:$APP_PORT" \
+            --arg ticket "$TICKET" \
+            --arg diff "$DIFF" \
+            --arg summary "$SUMMARY" \
+            '{repo:$repo, pr:$pr, sha:$sha, app_url:$url, ticket:$ticket, diff:$diff, summary:$summary}' \
+            > validate-body.json
+          echo "bytes=$(wc -c < validate-body.json)"
+
+      - name: Trigger validation
+        id: validate
+        run: |
+          RESP=$(curl -sSf -X POST \
+            "$VETTER_API_BASE/environments/$VETTER_ENV_ID/validate" \
+            -H "Authorization: Bearer $VETTER_API_KEY" \
+            -H 'Content-Type: application/json' \
+            --data-binary @validate-body.json)
+          echo "$RESP"
+          RUN_ID=$(echo "$RESP" | jq -er .run_id)
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for verdict
+        id: verdict
+        run: |
+          for i in $(seq 1 180); do
+            RESP=$(curl -sSf \
+              "$VETTER_API_BASE/environments/$VETTER_ENV_ID/runs/${{ steps.validate.outputs.run_id }}" \
+              -H "Authorization: Bearer $VETTER_API_KEY")
+            STATUS=$(echo "$RESP" | jq -r .status)
+            if [ "$STATUS" = "completed" ]; then
+              echo "$RESP" | jq .result > verdict.json
+              echo "got verdict"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "timeout waiting for verdict" >&2
+          exit 1
+
+      - name: Comment on PR
+        if: always() && hashFiles('verdict.json') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BODY=$(jq -r '.comment // tojson' verdict.json)
+          gh pr comment "${{ github.event.pull_request.number }}" --body "$BODY"
+
+      - name: Deregister daemon
+        if: always()
+        run: |
+          curl -sSf -X DELETE "$VETTER_API_BASE/register" \
+            -H 'Content-Type: application/json' \
+            -d "{\"env_id\":\"$VETTER_ENV_ID\",\"name\":\"$DAEMON_NAME\"}" || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vetter-logs-${{ github.event.pull_request.number }}-${{ github.run_id }}
+          path: |
+            app.log
+            daemon.log
+            tunnel.log
+            verdict.json
+          if-no-files-found: ignore

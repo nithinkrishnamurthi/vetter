@@ -1,0 +1,256 @@
+name: 'Vetter Validation'
+description: 'Validate your PR preview environment against a ticket with vetter'
+author: 'vetter'
+branding:
+  icon: 'check-circle'
+  color: 'green'
+
+inputs:
+  api-key:
+    description: 'Vetter API key (Bearer token for the vetter cloud API)'
+    required: true
+  env-id:
+    description: 'Vetter environment ID to run the validation against'
+    required: true
+  daemon-token:
+    description: 'Bearer token the daemon uses to authenticate incoming tool calls'
+    required: true
+  api-base:
+    description: 'Vetter cloud API base URL'
+    required: true
+  daemon-url:
+    description: 'URL to download the daemon binary (Linux/amd64)'
+    required: false
+    default: 'https://github.com/nithinkrishnamurthi/valid/releases/latest/download/daemon-linux-amd64'
+  app-url:
+    description: 'URL where the preview app is reachable from the runner'
+    required: false
+    default: 'http://localhost:3000'
+  daemon-port:
+    description: 'Local port the daemon listens on'
+    required: false
+    default: '8181'
+  daemon-name:
+    description: 'Display name for this daemon in the vetter dashboard'
+    required: false
+    default: 'gha-runner'
+  ticket-path:
+    description: 'Path to the ticket markdown file (optional)'
+    required: false
+    default: '.vetter/ticket.md'
+  verdict-timeout-minutes:
+    description: 'How long to wait for a validation verdict'
+    required: false
+    default: '30'
+
+outputs:
+  verdict-status:
+    description: 'pass | fail | error'
+    value: ${{ steps.parse.outputs.status }}
+  run-id:
+    description: 'Vetter run ID'
+    value: ${{ steps.validate.outputs.run_id }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install cloudflared
+      shell: bash
+      run: |
+        curl -sSfLo /tmp/cloudflared \
+          https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+        chmod +x /tmp/cloudflared
+        sudo mv /tmp/cloudflared /usr/local/bin/cloudflared
+
+    - name: Fetch daemon binary
+      shell: bash
+      env:
+        DAEMON_URL: ${{ inputs.daemon-url }}
+      run: |
+        curl -sSfL -o daemon "$DAEMON_URL"
+        chmod +x daemon
+
+    - name: Prewarm Playwright
+      shell: bash
+      run: |
+        # Force the one-time Chromium download up-front so the daemon's MCP
+        # child can start fast. Without this, first-run Chromium install
+        # (60-120s) happens while the validator is already trying to call
+        # /tools, causing 404s.
+        npx -y playwright@latest install --with-deps chromium
+
+    - name: Start daemon
+      shell: bash
+      env:
+        DAEMON_TOKEN: ${{ inputs.daemon-token }}
+        DAEMON_PORT: ${{ inputs.daemon-port }}
+      run: |
+        DAEMON_TOKEN="$DAEMON_TOKEN" \
+          nohup ./daemon --port "$DAEMON_PORT" > daemon.log 2>&1 &
+        echo "$!" > daemon.pid
+        for i in $(seq 1 30); do
+          if curl -sf "http://localhost:$DAEMON_PORT/health" >/dev/null; then
+            echo "daemon up"; exit 0
+          fi
+          sleep 1
+        done
+        echo "daemon did not come up" >&2
+        tail -n 200 daemon.log >&2
+        exit 1
+
+    - name: Open tunnel
+      id: tunnel
+      shell: bash
+      env:
+        DAEMON_PORT: ${{ inputs.daemon-port }}
+      run: |
+        nohup cloudflared tunnel --no-autoupdate --url "http://localhost:$DAEMON_PORT" \
+          > tunnel.log 2>&1 &
+        echo "$!" > tunnel.pid
+        for i in $(seq 1 30); do
+          URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' tunnel.log | head -n1 || true)
+          if [ -n "$URL" ]; then
+            echo "url=$URL" >> "$GITHUB_OUTPUT"
+            echo "tunnel: $URL"
+            exit 0
+          fi
+          sleep 1
+        done
+        echo "tunnel did not come up" >&2
+        tail -n 200 tunnel.log >&2
+        exit 1
+
+    - name: Register daemon
+      shell: bash
+      env:
+        VETTER_API_BASE: ${{ inputs.api-base }}
+        VETTER_ENV_ID: ${{ inputs.env-id }}
+        VETTER_DAEMON_TOKEN: ${{ inputs.daemon-token }}
+        DAEMON_NAME: ${{ inputs.daemon-name }}
+        TUNNEL_URL: ${{ steps.tunnel.outputs.url }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        jq -n \
+          --arg env "$VETTER_ENV_ID" \
+          --arg name "$DAEMON_NAME" \
+          --arg addr "$TUNNEL_URL" \
+          --arg tok "$VETTER_DAEMON_TOKEN" \
+          --arg pr "$PR_NUMBER" \
+          '{env_id:$env, name:$name, address:$addr, token:$tok, description:("PR #"+$pr)}' \
+          | curl -sSf -X POST "$VETTER_API_BASE/register" \
+              -H 'Content-Type: application/json' -d @-
+
+    - name: Collect PR context
+      id: context
+      shell: bash
+      env:
+        BASE_REF: ${{ github.event.pull_request.base.ref }}
+        PR_TITLE: ${{ github.event.pull_request.title }}
+        PR_BODY: ${{ github.event.pull_request.body }}
+        APP_URL: ${{ inputs.app-url }}
+        TICKET_PATH: ${{ inputs.ticket-path }}
+      run: |
+        git fetch origin "$BASE_REF" --depth=1 >/dev/null 2>&1 || true
+        if [ -f "$TICKET_PATH" ]; then
+          TICKET=$(cat "$TICKET_PATH")
+        else
+          TICKET=""
+        fi
+        DIFF=$(git diff "origin/$BASE_REF"...HEAD -- . ':(exclude)node_modules' ':(exclude)package-lock.json' || true)
+        SUMMARY="PR #${{ github.event.pull_request.number }}: ${PR_TITLE}"$'\n\n'"${PR_BODY}"
+
+        jq -n \
+          --arg repo "${{ github.repository }}" \
+          --arg sha "${{ github.event.pull_request.head.sha }}" \
+          --argjson pr ${{ github.event.pull_request.number }} \
+          --arg url "$APP_URL" \
+          --arg ticket "$TICKET" \
+          --arg diff "$DIFF" \
+          --arg summary "$SUMMARY" \
+          '{repo:$repo, pr:$pr, sha:$sha, app_url:$url, ticket:$ticket, diff:$diff, summary:$summary}' \
+          > validate-body.json
+        echo "bytes=$(wc -c < validate-body.json)"
+
+    - name: Trigger validation
+      id: validate
+      shell: bash
+      env:
+        VETTER_API_BASE: ${{ inputs.api-base }}
+        VETTER_API_KEY: ${{ inputs.api-key }}
+        VETTER_ENV_ID: ${{ inputs.env-id }}
+      run: |
+        RESP=$(curl -sSf -X POST \
+          "$VETTER_API_BASE/environments/$VETTER_ENV_ID/validate" \
+          -H "Authorization: Bearer $VETTER_API_KEY" \
+          -H 'Content-Type: application/json' \
+          --data-binary @validate-body.json)
+        echo "$RESP"
+        RUN_ID=$(echo "$RESP" | jq -er .run_id)
+        echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
+    - name: Wait for verdict
+      id: verdict
+      shell: bash
+      env:
+        VETTER_API_BASE: ${{ inputs.api-base }}
+        VETTER_API_KEY: ${{ inputs.api-key }}
+        VETTER_ENV_ID: ${{ inputs.env-id }}
+        TIMEOUT_MINUTES: ${{ inputs.verdict-timeout-minutes }}
+        RUN_ID: ${{ steps.validate.outputs.run_id }}
+      run: |
+        ITERS=$((TIMEOUT_MINUTES * 6))
+        for i in $(seq 1 $ITERS); do
+          RESP=$(curl -sSf \
+            "$VETTER_API_BASE/environments/$VETTER_ENV_ID/runs/$RUN_ID" \
+            -H "Authorization: Bearer $VETTER_API_KEY")
+          STATUS=$(echo "$RESP" | jq -r .status)
+          if [ "$STATUS" = "completed" ]; then
+            echo "$RESP" | jq .result > verdict.json
+            echo "got verdict"
+            exit 0
+          fi
+          sleep 10
+        done
+        echo "timeout waiting for verdict after ${TIMEOUT_MINUTES}m" >&2
+        exit 1
+
+    - name: Parse verdict
+      id: parse
+      if: always() && hashFiles('verdict.json') != ''
+      shell: bash
+      run: |
+        STATUS=$(jq -r '.status // "error"' verdict.json)
+        echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+
+    - name: Comment on PR
+      if: always() && hashFiles('verdict.json') != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        BODY=$(jq -r '.comment // tojson' verdict.json)
+        gh pr comment "$PR_NUMBER" --body "$BODY"
+
+    - name: Deregister daemon
+      if: always()
+      shell: bash
+      env:
+        VETTER_API_BASE: ${{ inputs.api-base }}
+        VETTER_ENV_ID: ${{ inputs.env-id }}
+        DAEMON_NAME: ${{ inputs.daemon-name }}
+      run: |
+        curl -sSf -X DELETE "$VETTER_API_BASE/register" \
+          -H 'Content-Type: application/json' \
+          -d "{\"env_id\":\"$VETTER_ENV_ID\",\"name\":\"$DAEMON_NAME\"}" || true
+
+    - name: Upload logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: vetter-logs-${{ github.event.pull_request.number }}-${{ github.run_id }}
+        path: |
+          daemon.log
+          tunnel.log
+          verdict.json
+        if-no-files-found: ignore
