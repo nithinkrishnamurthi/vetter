@@ -12,9 +12,6 @@ inputs:
   env-id:
     description: 'Vetter environment ID to run the validation against'
     required: true
-  daemon-token:
-    description: 'Bearer token the daemon uses to authenticate incoming tool calls'
-    required: true
   api-base:
     description: 'Vetter cloud API base URL'
     required: true
@@ -79,10 +76,18 @@ runs:
         # /tools, causing 404s.
         npx -y playwright@latest install --with-deps chromium
 
+    - name: Generate daemon token
+      id: gen_token
+      shell: bash
+      run: |
+        TOKEN=$(openssl rand -hex 32)
+        echo "::add-mask::$TOKEN"
+        echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
     - name: Start daemon
       shell: bash
       env:
-        DAEMON_TOKEN: ${{ inputs.daemon-token }}
+        DAEMON_TOKEN: ${{ steps.gen_token.outputs.token }}
         DAEMON_PORT: ${{ inputs.daemon-port }}
       run: |
         DAEMON_TOKEN="$DAEMON_TOKEN" \
@@ -125,7 +130,7 @@ runs:
       env:
         VETTER_API_BASE: ${{ inputs.api-base }}
         VETTER_ENV_ID: ${{ inputs.env-id }}
-        VETTER_DAEMON_TOKEN: ${{ inputs.daemon-token }}
+        VETTER_DAEMON_TOKEN: ${{ steps.gen_token.outputs.token }}
         DAEMON_NAME: ${{ inputs.daemon-name }}
         TUNNEL_URL: ${{ steps.tunnel.outputs.url }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
