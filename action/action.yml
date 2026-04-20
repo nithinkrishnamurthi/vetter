@@ -9,9 +9,6 @@ inputs:
   api-key:
     description: 'Vetter API key (Bearer token for the vetter cloud API)'
     required: true
-  env-id:
-    description: 'Vetter environment ID to run the validation against'
-    required: true
   api-base:
     description: 'Vetter cloud API base URL'
     required: true
@@ -47,10 +44,28 @@ outputs:
   run-id:
     description: 'Vetter run ID'
     value: ${{ steps.validate.outputs.run_id }}
+  env-id:
+    description: 'Vetter environment ID minted for this run'
+    value: ${{ steps.env.outputs.id }}
 
 runs:
   using: composite
   steps:
+    - name: Create vetter environment
+      id: env
+      shell: bash
+      env:
+        VETTER_API_BASE: ${{ inputs.api-base }}
+        VETTER_API_KEY: ${{ inputs.api-key }}
+      run: |
+        RESP=$(curl -sSf -X POST "$VETTER_API_BASE/environments" \
+          -H "Authorization: Bearer $VETTER_API_KEY" \
+          -H 'Content-Type: application/json' \
+          -d '{"mode":"external"}')
+        ENV_ID=$(echo "$RESP" | jq -er .id)
+        echo "id=$ENV_ID" >> "$GITHUB_OUTPUT"
+        echo "created env $ENV_ID"
+
     - name: Install cloudflared
       shell: bash
       run: |
@@ -129,7 +144,7 @@ runs:
       shell: bash
       env:
         VETTER_API_BASE: ${{ inputs.api-base }}
-        VETTER_ENV_ID: ${{ inputs.env-id }}
+        VETTER_ENV_ID: ${{ steps.env.outputs.id }}
         VETTER_DAEMON_TOKEN: ${{ steps.gen_token.outputs.token }}
         DAEMON_NAME: ${{ inputs.daemon-name }}
         TUNNEL_URL: ${{ steps.tunnel.outputs.url }}
@@ -182,7 +197,7 @@ runs:
       env:
         VETTER_API_BASE: ${{ inputs.api-base }}
         VETTER_API_KEY: ${{ inputs.api-key }}
-        VETTER_ENV_ID: ${{ inputs.env-id }}
+        VETTER_ENV_ID: ${{ steps.env.outputs.id }}
       run: |
         RESP=$(curl -sSf -X POST \
           "$VETTER_API_BASE/environments/$VETTER_ENV_ID/validate" \
@@ -199,7 +214,7 @@ runs:
       env:
         VETTER_API_BASE: ${{ inputs.api-base }}
         VETTER_API_KEY: ${{ inputs.api-key }}
-        VETTER_ENV_ID: ${{ inputs.env-id }}
+        VETTER_ENV_ID: ${{ steps.env.outputs.id }}
         TIMEOUT_MINUTES: ${{ inputs.verdict-timeout-minutes }}
         RUN_ID: ${{ steps.validate.outputs.run_id }}
       run: |
@@ -248,12 +263,23 @@ runs:
       shell: bash
       env:
         VETTER_API_BASE: ${{ inputs.api-base }}
-        VETTER_ENV_ID: ${{ inputs.env-id }}
+        VETTER_ENV_ID: ${{ steps.env.outputs.id }}
         DAEMON_NAME: ${{ inputs.daemon-name }}
       run: |
         curl -sSf -X DELETE "$VETTER_API_BASE/register" \
           -H 'Content-Type: application/json' \
           -d "{\"env_id\":\"$VETTER_ENV_ID\",\"name\":\"$DAEMON_NAME\"}" || true
+
+    - name: Delete vetter environment
+      if: always() && steps.env.outputs.id != ''
+      shell: bash
+      env:
+        VETTER_API_BASE: ${{ inputs.api-base }}
+        VETTER_API_KEY: ${{ inputs.api-key }}
+        VETTER_ENV_ID: ${{ steps.env.outputs.id }}
+      run: |
+        curl -sSf -X DELETE "$VETTER_API_BASE/environments/$VETTER_ENV_ID" \
+          -H "Authorization: Bearer $VETTER_API_KEY" || true
 
     - name: Upload logs
       if: always()
