@@ -9,6 +9,9 @@ inputs:
   api-key:
     description: 'Vetter API key (Bearer token for the vetter cloud API)'
     required: true
+  api-base:
+    description: 'Deprecated; ignored. The action always targets https://api.getvetter.dev.'
+    required: false
   daemon-url:
     description: 'URL to download the daemon binary (Linux/amd64)'
     required: false
