@@ -46,7 +46,6 @@ jobs:
           api-key: ${{ secrets.VETTER_API_KEY }}
           env-id: ${{ secrets.VETTER_ENV_ID }}
           daemon-token: ${{ secrets.VETTER_DAEMON_TOKEN }}
-          api-base: ${{ vars.VETTER_API_BASE }}
           app-url: http://localhost:3000
 ```
 

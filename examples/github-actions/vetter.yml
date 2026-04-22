@@ -10,7 +10,6 @@ name: vetter
 #       api-key: ${{ secrets.VETTER_API_KEY }}
 #       env-id: ${{ secrets.VETTER_ENV_ID }}
 #       daemon-token: ${{ secrets.VETTER_DAEMON_TOKEN }}
-#       api-base: ${{ vars.VETTER_API_BASE }}
 
 on:
   pull_request:
@@ -29,7 +28,7 @@ jobs:
       pull-requests: write
 
     env:
-      VETTER_API_BASE: ${{ vars.VETTER_API_BASE }}
+      VETTER_API_BASE: https://api.getvetter.dev
       VETTER_API_KEY: ${{ secrets.VETTER_API_KEY }}
       VETTER_ENV_ID: ${{ secrets.VETTER_ENV_ID }}
       VETTER_DAEMON_TOKEN: ${{ secrets.VETTER_DAEMON_TOKEN }}

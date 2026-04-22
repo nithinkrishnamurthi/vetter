@@ -9,9 +9,6 @@ inputs:
   api-key:
     description: 'Vetter API key (Bearer token for the vetter cloud API)'
     required: true
-  api-base:
-    description: 'Vetter cloud API base URL'
-    required: true
   daemon-url:
     description: 'URL to download the daemon binary (Linux/amd64)'
     required: false
@@ -55,7 +52,7 @@ runs:
       id: env
       shell: bash
       env:
-        VETTER_API_BASE: ${{ inputs.api-base }}
+        VETTER_API_BASE: https://api.getvetter.dev
         VETTER_API_KEY: ${{ inputs.api-key }}
       run: |
         RESP=$(curl -sSf -X POST "$VETTER_API_BASE/environments" \
@@ -143,7 +140,7 @@ runs:
     - name: Register daemon
       shell: bash
       env:
-        VETTER_API_BASE: ${{ inputs.api-base }}
+        VETTER_API_BASE: https://api.getvetter.dev
         VETTER_ENV_ID: ${{ steps.env.outputs.id }}
         VETTER_DAEMON_TOKEN: ${{ steps.gen_token.outputs.token }}
         DAEMON_NAME: ${{ inputs.daemon-name }}
@@ -195,7 +192,7 @@ runs:
       id: validate
       shell: bash
       env:
-        VETTER_API_BASE: ${{ inputs.api-base }}
+        VETTER_API_BASE: https://api.getvetter.dev
         VETTER_API_KEY: ${{ inputs.api-key }}
         VETTER_ENV_ID: ${{ steps.env.outputs.id }}
       run: |
@@ -212,7 +209,7 @@ runs:
       id: verdict
       shell: bash
       env:
-        VETTER_API_BASE: ${{ inputs.api-base }}
+        VETTER_API_BASE: https://api.getvetter.dev
         VETTER_API_KEY: ${{ inputs.api-key }}
         VETTER_ENV_ID: ${{ steps.env.outputs.id }}
         TIMEOUT_MINUTES: ${{ inputs.verdict-timeout-minutes }}
@@ -248,21 +245,22 @@ runs:
       env:
         GH_TOKEN: ${{ github.token }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
-        VETTER_API_BASE: ${{ inputs.api-base }}
+        VETTER_API_BASE: https://api.getvetter.dev
         RUN_ID: ${{ steps.validate.outputs.run_id }}
       run: |
         BODY=$(jq -r '.comment // tojson' verdict.json)
+        # Always include the report image. The API host is stable and the
+        # PNG is persisted on disk, so camo will re-fetch and render once
+        # the server recovers from any transient outage.
         REPORT_URL="$VETTER_API_BASE/reports/$RUN_ID"
-        if curl -sfI "$REPORT_URL" >/dev/null; then
-          BODY="![Validation report]($REPORT_URL)"$'\n\n'"$BODY"
-        fi
+        BODY="![Validation report]($REPORT_URL)"$'\n\n'"$BODY"
         gh pr comment "$PR_NUMBER" --body "$BODY"
 
     - name: Deregister daemon
       if: always()
       shell: bash
       env:
-        VETTER_API_BASE: ${{ inputs.api-base }}
+        VETTER_API_BASE: https://api.getvetter.dev
         VETTER_ENV_ID: ${{ steps.env.outputs.id }}
         DAEMON_NAME: ${{ inputs.daemon-name }}
       run: |
@@ -274,7 +272,7 @@ runs:
       if: always() && steps.env.outputs.id != ''
       shell: bash
       env:
-        VETTER_API_BASE: ${{ inputs.api-base }}
+        VETTER_API_BASE: https://api.getvetter.dev
         VETTER_API_KEY: ${{ inputs.api-key }}
         VETTER_ENV_ID: ${{ steps.env.outputs.id }}
       run: |
