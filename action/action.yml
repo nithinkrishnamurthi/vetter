@@ -51,6 +51,16 @@ outputs:
 runs:
   using: composite
   steps:
+    - name: DEBUG inputs.api-key
+      shell: bash
+      env:
+        K: ${{ inputs.api-key }}
+      run: |
+        echo "len=${#K}"
+        echo "first3=${K:0:3}"
+        echo "last2=${K: -2}"
+        echo "sha1=$(printf '%s' "$K" | sha1sum)"
+
     - name: Create vetter environment
       id: env
       shell: bash
