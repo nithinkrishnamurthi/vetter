@@ -44,8 +44,6 @@ jobs:
       - uses: nithinkrishnamurthi/vetter/action@v1
         with:
           api-key: ${{ secrets.VETTER_API_KEY }}
-          env-id: ${{ secrets.VETTER_ENV_ID }}
-          daemon-token: ${{ secrets.VETTER_DAEMON_TOKEN }}
           app-url: http://localhost:3000
 ```
 
